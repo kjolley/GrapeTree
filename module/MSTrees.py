@@ -1,7 +1,10 @@
-import numpy as np, dendropy as dp, networkx as nx
+from __future__ import print_function
+import numpy as np, networkx as nx, argparse
+from numba import jit
+from glob import glob
+from ete3 import Tree
 from subprocess import Popen, PIPE
 import sys, os, tempfile, platform, re, tempfile, psutil
-import argparse
 
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -20,23 +23,43 @@ params = dict(method='MSTreeV2', # MSTree , NJ
               edmonds_Windows = os.path.join(base_dir, 'binaries', 'edmonds.exe'),
               edmonds_Darwin = os.path.join(base_dir, 'binaries', 'edmonds-osx'),
               edmonds_Linux = os.path.join(base_dir, 'binaries', 'edmonds-linux'),
-              goeburst_Linux = os.path.join(base_dir, 'binaries', 'goeburst'),
+              RapidNJ_Linux = os.path.join(base_dir, 'binaries', 'rapidnj'),
+              RapidNJ_Darwin = os.path.join(base_dir, 'binaries', 'rapidnj-osx'),
+              RapidNJ_Windows = os.path.join(base_dir, 'binaries', 'rapidnj.exe'),
              )
 
+@jit(nopython=True)
+def contemporary(a,b,c, n_loci) :
+    a[0], a[1] = max(min(a[0], n_loci-0.5), 0.5), max(min(a[1], n_loci-0.5), 0.5);
+    b, c = max(min(b, n_loci-0.5), 0.5), max(min(c, n_loci-0.5), 0.5)
+    if b >= a[0] + c and b >= a[1] + c :
+        return False
+    elif b == c :
+        return True
+    s11, s12 = np.sqrt(1-a[0]/n_loci), (2*n_loci - b - c)/2/np.sqrt(n_loci*(n_loci-a[0]))
+    v = 1-((n_loci-a[1])*(n_loci-c)/n_loci+(n_loci-b))/2/n_loci
+    s21, s22 = 1+a[1]*v/(b-2*n_loci*v), 1+c*v/(b-2*n_loci*v)
+
+    p1 = a[0]*np.log(1-s11*s11) + (n_loci-a[0])*np.log(s11*s11) + (b+c)*np.log(1-s11*s12) + (2*n_loci-b-c)*np.log(s11*s12)
+    p2 = a[1]*np.log(1-s21) + (n_loci-a[1])*np.log(s21) + b*np.log(1-s21*s22) + (n_loci-b)*np.log(s21*s22) + c*np.log(1-s22) + (n_loci-c)*np.log(s22)
+    return p1 >= p2
 
 def add_args() :
-    parser = argparse.ArgumentParser(description='Parameters for command line version of GrapeTree. \nYou can drag the Newick output into the web interface. ', formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('--profile', '-p', help='A file contains either MLST / SNP profiles or multile aligned sequences in fasta format.', required=True)
-    parser.add_argument('--method', '-m', help='backend algorithms to call. Allowed values are "MSTreeV2" [default], "MSTree" and "NJ"', default='MSTreeV2')
-    parser.add_argument('--matrix', '-x', dest='matrix_type', help='Either "symmetric" [default for MSTree and NJ] \nor "asymmetric" [default for MSTreeV2]. ', default='symmetric')
-    parser.add_argument('--recraft', '-r', dest='branch_recraft', help='Allows local branch recrafting after tree construction. Default in MSTreeV2. ', default=False, action="store_true")
-    parser.add_argument('--missing', '-y', dest='handle_missing', help='Alternative ways of handling missing data.\n0: missing data are ignored in pairwise comparisons [default]. \n1: Columns that have missing data are ignored in the whole analysis. \n2: missing data are treated as a special value (allele). \n3: Naive counting of absolute differences between profiles. ', default=0, type=int)
-    parser.add_argument('--wgMLST', '-w', help='Experimental option for a better support of wgMLST schemes.', default=False, action="store_true")
-    parser.add_argument('--heuristic', '-t', dest='heuristic', help='Tiebreak rules between co-optimal edges. Only used in MSTree [default: eBurst] and MSTreeV2 [default: harmonic]', default='eBurst')
-    parser.add_argument('--n_proc', '-n', help='Number of processes. Default: 5. ', type=int, default=5)
-    parser.add_argument('--check', '-c', dest='checkEnv', help='Do not calculate the tree but only show the expected time/memory consumption. ', default=False, action="store_true")
+    parser = argparse.ArgumentParser(description='For details, see "https://github.com/achtman-lab/GrapeTree/blob/master/README.md".\nIn brief, GrapeTree generates a NEWICK tree to the default output (screen) \nor a redirect output, e.g., a file. ', formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('--profile', '-p', dest='fname', help='[REQUIRED] An input filename of a file containing MLST or SNP character data, OR a fasta file containing aligned sequences. \n', required=True)
+    parser.add_argument('--method', '-m', dest='tree', help='"MSTreeV2" [DEFAULT]\n"MSTree"\n"NJ": FastME V2 NJ tree\n"RapidNJ": RapidNJ for very large datasets\n"distance": p-distance matrix in PHYLIP format.', default='MSTreeV2')
+    parser.add_argument('--matrix', '-x', dest='matrix_type', help='"symmetric": [DEFAULT: MSTree, NJ and RapidNJ] \n"asymmetric": [DEFAULT: MSTreeV2].\n', default='symmetric')
+    parser.add_argument('--recraft', '-r', dest='branch_recraft', help='Triggers local branch recrafting. [DEFAULT: MSTreeV2]. ', default=False, action="store_true")
+    parser.add_argument('--missing', '-y', dest='handler', help='ONLY FOR symmetric DISTANCE MATRIX. \n0: [DEFAULT] ignore missing data in pairwise comparison. \n1: Remove column with missing data. \n2: treat data as an allele. \n3: Absolute number of allelic differences. ', default=0, type=int)
+    parser.add_argument('--wgMLST', '-w', help='[EXPERIMENTAL] a better support of wgMLST schemes.', default=False, action="store_true")
+    parser.add_argument('--heuristic', '-t', dest='heuristic', help='Tiebreak heuristic used only in MSTree and MSTreeV2\n"eBurst" [DEFAULT: MSTree]\n"harmonic" [DEFAULT: MSTreeV2]', default='eBurst')
+    parser.add_argument('--n_proc', '-n',  dest='number_of_processes', help='Number of CPU processes in parallel use. [DEFAULT]: 5. ', type=int, default=5)
+    parser.add_argument('--check', '-c', dest='checkEnv', help='Only calculate the expected time/memory requirements. ', default=False, action="store_true")
     args = parser.parse_args()
-    args.handle_missing = ['pair_delete', 'complete_delete', 'as_allele', 'absolute_distance'][args.handle_missing]
+    args.profile = args.fname
+    args.method = args.tree
+    args.n_proc = args.number_of_processes
+    args.handle_missing = ['pair_delete', 'complete_delete', 'as_allele', 'absolute_distance'][args.handler]
     return args.__dict__
 
 def parallel_distance(callup) :
@@ -201,14 +224,14 @@ class methods(object) :
         np.fill_diagonal(dist, 0.0)
         dist[dist > dist.T] = dist.T[dist > dist.T]
         try:
-            res = minimum_spanning_tree(dist)
-            dist = np.round(dist, 0)
-            return res
-        except :
             g = nx.Graph(dist)
             ms = nx.minimum_spanning_tree(g)
             dist = np.round(dist, 0)
             return [[d[0], d[1], int(d[2]['weight'])] for d in ms.edges(data=True)]
+        except :
+            res = minimum_spanning_tree(dist)
+            dist = np.round(dist, 0)
+            return res
 
     @staticmethod
     def _asymmetric(dist, weight, **params) :
@@ -230,7 +253,7 @@ class methods(object) :
             shortcuts = get_shortcut(wdist, weight)
             for (s, t, d) in shortcuts :
                 wdist[s, wdist[s] > wdist[t]] = wdist[t, wdist[s] > wdist[t]]
-                presence[t] = -1
+            presence[shortcuts.T[1]] = -1
             wdist = wdist.T[presence >= 0].T[presence >= 0]
             presence = presence[presence >=0]
 
@@ -241,6 +264,8 @@ class methods(object) :
             del wdist, d
             mstree = Popen([params['edmonds_' + platform.system()], wdist_file], stdout=PIPE).communicate()[0]
             os.unlink(wdist_file)
+            if isinstance(mstree, bytes) :
+                mstree = mstree.decode('utf8')
             mstree = np.array([ br.strip().split() for br in mstree.strip().split('\n')], dtype=float).astype(int)
             assert mstree.size > 0
             mstree.T[2] -= 1
@@ -270,20 +295,6 @@ class methods(object) :
 
     @staticmethod
     def _branch_recraft(branches, dist, weights, n_loci) :
-        def contemporary(a,b,c) :
-            a[0], a[1] = max(min(a[0], n_loci-0.5), 0.5), max(min(a[1], n_loci-0.5), 0.5);
-            b, c = max(min(b, n_loci-0.5), 0.5), max(min(c, n_loci-0.5), 0.5)
-            if b >= a[0] + c and b >= a[1] + c :
-                return False
-            elif b == c :
-                return True
-            s11, s12 = np.sqrt(1-a[0]/n_loci), (2*n_loci - b - c)/2/np.sqrt(n_loci*(n_loci-a[0]))
-            v = 1-((n_loci-a[1])*(n_loci-c)/n_loci+(n_loci-b))/2/n_loci
-            s21, s22 = 1+a[1]*v/(b-2*n_loci*v), 1+c*v/(b-2*n_loci*v)
-
-            p1 = a[0]*np.log(1-s11*s11) + (n_loci-a[0])*np.log(s11*s11) + (b+c)*np.log(1-s11*s12) + (2*n_loci-b-c)*np.log(s11*s12)
-            p2 = a[1]*np.log(1-s21) + (n_loci-a[1])*np.log(s21) + b*np.log(1-s21*s22) + (n_loci-b)*np.log(s21*s22) + c*np.log(1-s22) + (n_loci-c)*np.log(s22)
-            return p1 >= p2
 
         if n_loci is None :
             n_loci = np.max(dist)
@@ -302,7 +313,7 @@ class methods(object) :
                 for w, d, s in sorted(zip(weights[sources], dist[sources, tgt], sources))[:3] :
                     if s == src : break
                     if d < 1.5*dist[src, tgt] :
-                        if contemporary([dist[s, src], dist[src, s]], d, dist[src, tgt]) :
+                        if contemporary([dist[s, src], dist[src, s]], d, dist[src, tgt], n_loci) :
                             tried[src], src = s, s
                             break
                 while src not in tried :
@@ -310,11 +321,11 @@ class methods(object) :
                     mid_nodes = sorted([[weights[s], dist[s,tgt], s] for s in childrens[src] if s not in tried and dist[s,tgt] < 2*dist[src, tgt]])
                     for w, d, s in mid_nodes :
                         if d < dist[src, tgt] :
-                            if not contemporary([dist[src, s], dist[s, src]], dist[src, tgt], d) :
+                            if not contemporary([dist[src, s], dist[s, src]], dist[src, tgt], d, n_loci) :
                                 tried[src], src = s, s
                                 break
                         elif w < weights[src] :
-                            if contemporary([dist[s, src], dist[src, s]], d, dist[src, tgt]) :
+                            if contemporary([dist[s, src], dist[src, s]], d, dist[src, tgt], n_loci) :
                                 tried[src], src = s, s
                                 break
                         tried[s] = src
@@ -322,7 +333,7 @@ class methods(object) :
                 for w, d, t in sorted(zip(weights[targets], dist[src, targets], targets))[:3] :
                     if t == tgt : break
                     if d < 1.5*dist[src, tgt] :
-                        if contemporary([dist[t, tgt], dist[tgt, t]], d, dist[src, tgt]) :
+                        if contemporary([dist[t, tgt], dist[tgt, t]], d, dist[src, tgt], n_loci) :
                             tried[tgt], tgt = t, t
                             break
                 while tgt not in tried :
@@ -330,11 +341,11 @@ class methods(object) :
                     mid_nodes = sorted([[weights[t], dist[src,t], t] for t in childrens[tgt] if t not in tried and dist[src, t] < 2*dist[src, tgt]])
                     for w, d, s in mid_nodes :
                         if d < dist[src, tgt] :
-                            if not contemporary([dist[tgt, t], dist[t, tgt]], dist[src, tgt], d) :
+                            if not contemporary([dist[tgt, t], dist[t, tgt]], dist[src, tgt], d, n_loci) :
                                 tried[tgt], tgt = t, t
                                 break
                         elif w < weights[tgt] :
-                            if contemporary([dist[t, tgt], dist[tgt, t]], d, dist[src, tgt]) :
+                            if contemporary([dist[t, tgt], dist[tgt, t]], d, dist[src, tgt], n_loci) :
                                 tried[tgt], tgt = t, t
                                 break
                         tried[t] = tgt
@@ -370,21 +381,22 @@ class methods(object) :
                     remain.append(br)
             branches = remain
 
-        tre = dp.Tree()
-        node = tre.seed_node
-        node.taxon = tre.taxon_namespace.new_taxon(label=branch[0][0])
+        tre = Tree()
+        nodeFinder = {}
+        
+        tre.name = branch[0][0]
+        nodeFinder[tre.name] = tre
         for src, tgt, dif in branch :
-            node = tre.find_node_with_taxon_label(src)
-            n = dp.Node(taxon=node.taxon)
-            node.add_child(n)
-            n.edge_length = 0.0
-            node.__dict__['taxon'] = None
-
-            n = dp.Node(taxon=tre.taxon_namespace.new_taxon(label=tgt))
-            node.add_child(n)
-            n.edge_length = dif
-        for taxon in tre.taxon_namespace :
-            taxon.label = names[taxon.label]
+            node = nodeFinder[src]
+            child = node.add_child(name=tgt, dist=dif)
+            nodeFinder[child.name] = child
+        for node in tre.traverse('postorder') :
+            if not node.is_leaf() :
+                name = node.name
+                node.name = ''
+                node.add_child(name=names[name], dist=0.)
+            else :
+                node.name = names[node.name]
         return tre
 
 
@@ -419,16 +431,20 @@ class methods(object) :
         tree = distance_matrix.symmetric_link(profiles, tree, handle_missing= handle_missing)
         tree = methods._network2tree(tree, names)
         return tree
+
     @staticmethod
     def distance(names, profiles, embeded, matrix_type='symmetric', handle_missing='pair_delete', **params) :
         ids = {n:id for id, n in enumerate(names)}
-        ids = { gg:ids[k] for k,g in embeded.iteritems() for gg in g }
+        ids = { gg:ids[k] for k,g in embeded.items() for gg in g }
         names, indices = [], []
-        for n, i in sorted(ids.iteritems(), key=lambda x:(x[1], x[0])) :
+        for n, i in sorted(ids.items(), key=lambda x:(x[1], x[0])) :
             names.append(n)
             indices.append(i)
         indices = np.array(indices)
         d = distance_matrix.get_distance(matrix_type, profiles, handle_missing)
+        if handle_missing != 'absolute_distance' :
+            d /= profiles.shape[1]
+
         dist = np.zeros([len(names), len(names)])
         for i, i2 in enumerate(indices) :
             dist[i] = d[i2, indices]
@@ -437,6 +453,36 @@ class methods(object) :
             dist_txt.append('{0!s:10} {1}'.format(n, ' '.join(['{:.6f}'.format(dd) for dd in d])))
         return dist_txt
 
+    @staticmethod
+    def fastme(names, profiles, embeded, handle_missing='pair_delete', **params) :
+        dist = distance_matrix.get_distance('symmetric', profiles, handle_missing)
+
+        dist_file = params['tempfix'] + 'dist.list'
+        with open(dist_file, 'w') as fout :
+            fout.write('    {0}\n'.format(dist.shape[0]))
+            for n, d in enumerate(dist) :
+                fout.write( '{0!s:10} {1}\n'.format(n, ' '.join(['{:.6f}'.format(dd) for dd in d])) )
+        del dist, d
+        try :
+            Popen([params['NJ_{0}'.format(platform.system())], '-i', dist_file, '-m', 'B', '-n', 'B'], stdout=PIPE).communicate()
+        except Exception as e :
+            if platform.system() == 'Linux' :
+                Popen([params['NJ_Linux32'], '-i', dist_file, '-m', 'N'], stdout=PIPE).communicate()
+            else :
+                raise e
+        tree = Tree(dist_file + '_fastme_tree.nwk')
+        for fname in glob(dist_file + '*') :
+            os.unlink(fname)
+        
+        try:
+            tree.set_outgroup(tree.get_midpoint_outgroup())
+            tree.unroot()            
+        except :
+            pass
+
+        for leaf in tree.get_leaves() :
+            leaf.name = names[int(leaf.name.strip("'"))]
+        return tree
     @staticmethod
     def NJ(names, profiles, embeded, handle_missing='pair_delete', **params) :
         dist = distance_matrix.get_distance('symmetric', profiles, handle_missing)
@@ -454,17 +500,70 @@ class methods(object) :
                 Popen([params['NJ_Linux32'], '-i', dist_file, '-m', 'N'], stdout=PIPE).communicate()
             else :
                 raise e
-        tree = dp.Tree.get_from_path(dist_file + '_fastme_tree.nwk', schema='newick')
-        try :
-            tree.reroot_at_midpoint()
-        except :
-            pass
-        tree.is_rooted = False
-        from glob import glob
+        tree = Tree(dist_file + '_fastme_tree.nwk')
         for fname in glob(dist_file + '*') :
             os.unlink(fname)
-        for taxon in tree.taxon_namespace :
-            taxon.label = names[int(taxon.label)]
+        
+        try:
+            tree.set_outgroup(tree.get_midpoint_outgroup())
+            tree.unroot()            
+        except :
+            pass
+
+        for leaf in tree.get_leaves() :
+            leaf.name = names[int(leaf.name.strip("'"))]
+        return tree
+    @staticmethod
+    def RapidNJ(names, profiles, embeded, handle_missing='pair_delete', **params) :
+        dist = distance_matrix.get_distance('symmetric', profiles, handle_missing)
+
+        dist_file = params['tempfix'] + 'dist.list'
+        with open(dist_file, 'w') as fout :
+            fout.write('    {0}\n'.format(dist.shape[0]))
+            for n, d in enumerate(dist) :
+                fout.write( '{0!s:10} {1}\n'.format(n, ' '.join(['{:.6f}'.format(dd) for dd in d])) )
+        del dist, d
+        Popen([params['RapidNJ_{0}'.format(platform.system())], '-n', '-x', dist_file+'_rapidnj.nwk', '-i', 'pd', dist_file], stdout=PIPE, stderr=PIPE).communicate()
+        tree = Tree(dist_file + '_rapidnj.nwk')
+        for fname in glob(dist_file + '*') :
+            os.unlink(fname)
+        
+        try:
+            tree.set_outgroup(tree.get_midpoint_outgroup())
+            tree.unroot()            
+        except :
+            pass
+
+        for leaf in tree.get_leaves() :
+            leaf.name = names[int(leaf.name.strip("'"))]
+        return tree
+    @staticmethod
+    def ninja(names, profiles, embeded, handle_missing='pair_delete', **params) :
+        dist = distance_matrix.get_distance('symmetric', profiles, handle_missing)
+        dist = dist/profiles.shape[1]
+        dist_file = params['tempfix'] + 'dist.list'
+        with open(dist_file, 'w') as fout :
+            fout.write('    {0}\n'.format(dist.shape[0]))
+            for n, d in enumerate(dist) :
+                fout.write( '{0!s:10} {1}\n'.format(n, ' '.join(['{:.6f}'.format(dd) for dd in d])) )
+        del dist, d
+        free_memory = int(0.9*psutil.virtual_memory().total/(1024.**2))
+        ninja_out = Popen(['java', '-server', '-Xmx'+str(free_memory)+'M', '-jar', params['ninja_{0}'.format(platform.system())], '--in_type', 'd', dist_file], stdout=PIPE, stderr=PIPE).communicate()
+        tree = Tree(ninja_out[0])
+        
+        for node in tree.traverse() :
+            edge.dist *= profiles.shape[1]
+        for fname in glob(dist_file + '*') :
+            os.unlink(fname)
+        
+        try:
+            tree.set_outgroup(tree.get_midpoint_outgroup())
+            tree.unroot()            
+        except :
+            pass
+
+        for leaf in tree.get_leaves() :
+            leaf.name = names[int(leaf.name.strip("'"))]
         return tree
 
 def nonredundant(names, profiles) :
@@ -516,14 +615,11 @@ def backend(**args) :
         To run a NJ tree (using FastME 2.0) :
         backend(profile=<filename>, method='NJ')
 
+        To run a RapidNJ tree :
+        backend(profile=<filename>, method='RapidNJ')
+
         To obtain a standard distance matrix :
         backend(profile=<filename>, method='distance')
-
-    Can also be called in command line:
-        MSTreeV2: MSTrees.py profile=<filename> method=MSTreeV2
-        MSTree: MSTrees.py profile=<filename> method=MSTree
-        NJ:  MSTrees.py profile=<filename> method=NJ
-        distance:  MSTrees.py profile=<filename> method=distance
     '''
     global params
     params.update(args)
@@ -585,17 +681,28 @@ def backend(**args) :
         params['dist_subfile'] = params['tempfix']+'.dist.{0}.npy'
         tre = eval('methods.' + params['method'])(names, profiles, embeded, **params)
         if params['method'] != 'distance' :
-            for taxon in tre.taxon_namespace :
-                embeded_group = embeded[taxon.label]
+            maxDist = 0.
+            for node in tre.iter_descendants() :
+                if node.dist > maxDist: maxDist = node.dist
+            if maxDist > 3 :
+                for node in tre.iter_descendants('postorder') :
+                    if node.dist < 0.1 and node.dist > 0 :
+                        for s in node.get_sisters() :
+                            s.dist += node.dist
+                        node.dist = 0
+            for leaf in tre.get_leaves() :
+                embeded_group = embeded[leaf.name]
                 if len(embeded_group) > 1 :
-                    taxon.label = '({0}:0)'.format(':0,'.join(embeded_group))
+                    leaf.name = ''
+                    for n in embeded_group :
+                        leaf.add_child(name=n, dist=0.)
 
             for fname in (params['prof_file'], params['dist_file']) :
                 try:
                     os.unlink(fname)
                 except :
                     pass
-            return tre.as_string('newick').replace("'", "")
+            return tre.write(format=1).replace("'", "")
         else :
             for fname in (params['prof_file'], params['dist_file']) :
                 try:
@@ -605,7 +712,7 @@ def backend(**args) :
             return '\n'.join(tre)
 
 def estimate_Consumption(platform, method, matrix, n_proc, n_loci, n_profile) :
-    if method == 'MSTree' :
+    if method in ('MSTree', 'RapidNJ') :
         if matrix == 'asymmetric' :
             if platform == 'Windows' :
                 time = 5.600754e-6 * n_profile * n_profile + 6.22306e-9 * n_loci * n_profile * n_profile/n_proc + 22.71
@@ -632,5 +739,5 @@ def estimate_Consumption(platform, method, matrix, n_proc, n_loci, n_profile) :
 
 if __name__ == '__main__' :
     tre = backend(**add_args())
-    print tre
+    print(tre)
 
